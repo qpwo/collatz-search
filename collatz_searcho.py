@@ -22,7 +22,7 @@ import triton.language as tl
 # ----------------------------
 # Config
 # ----------------------------
-BATCH_SIZE      = 1024 * 16
+BATCH_SIZE      = 1024 * 64
 BEST_ORIGINALS_POOL_SIZE = 1024
 num_elite = BATCH_SIZE // 4
 num_random = BATCH_SIZE // 4
@@ -49,6 +49,20 @@ UINT64_MAX      = (1 << 64) - 1
 # High-Performance Batched Kernels
 # ----------------------------
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=4, num_stages=4),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=4),
+        triton.Config({}, num_warps=16, num_stages=2),
+        triton.Config({}, num_warps=16, num_stages=3),
+    ],
+    key=['n_words_op'],
+    reset_to_zero=['out_ptr', 'carry0_ptr', 'allones_ptr'],
+)
 @triton.jit
 def k_add_block_pass1_batched(
     a_ptr, b_ptr, out_ptr, carry0_ptr, allones_ptr,
@@ -88,6 +102,16 @@ def k_add_block_pass1_batched(
         tl.store(base_carry0 + pid_block, tl.cast(carry, tl.uint8))
         tl.store(base_allones + pid_block, tl.cast(allones, tl.uint8))
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=1),
+        triton.Config({}, num_warps=2),
+        triton.Config({}, num_warps=4),
+        triton.Config({}, num_warps=8),
+    ],
+    key=[],
+    reset_to_zero=['c_in_ptr'],
+)
 @triton.jit
 def k_propagate_carries_scan_batched(
     carry0_ptr, allones_ptr, c_in_ptr, n_blocks_ptr, initial_carry,
@@ -140,6 +164,17 @@ def k_inc_blocks_pass2_batched(
         carry = tl.where(overflow, 1, 0)
         i += 1
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4),
+        triton.Config({}, num_warps=8),
+        triton.Config({}, num_warps=16),
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=16, num_stages=2),
+    ],
+    key=[],
+)
 @triton.jit
 def k_shl1_batched(in_ptr, out_ptr, n_words_ptr, WORDS_STRIDE: tl.constexpr):
     pid_batch = tl.program_id(0)
@@ -157,6 +192,17 @@ def k_shl1_batched(in_ptr, out_ptr, n_words_ptr, WORDS_STRIDE: tl.constexpr):
     out = (cur << 1) | carry_in
     tl.store(base_out + pid_word, out)
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4),
+        triton.Config({}, num_warps=8),
+        triton.Config({}, num_warps=16),
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=16, num_stages=2),
+    ],
+    key=[],
+)
 @triton.jit
 def k_shr_any_batched(in_ptr, out_ptr, n_words_ptr, k_bits_ptr, WORDS_STRIDE: tl.constexpr):
     pid_batch = tl.program_id(0)
@@ -184,6 +230,19 @@ def k_shr_any_batched(in_ptr, out_ptr, n_words_ptr, k_bits_ptr, WORDS_STRIDE: tl
         out = (low >> bit_shift) | (hi << (64 - bit_shift))
     tl.store(base_out + pid_word_out, out)
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4),
+        triton.Config({}, num_warps=8),
+        triton.Config({}, num_warps=16),
+        triton.Config({}, num_warps=32),
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=16, num_stages=2),
+    ],
+    key=[],
+    reset_to_zero=['hi_out_ptr'],
+)
 @triton.jit
 def k_find_hi_batched(words_ptr, hi_out_ptr, WORDS_STRIDE: tl.constexpr):
     pid_batch = tl.program_id(0)
@@ -196,6 +255,19 @@ def k_find_hi_batched(words_ptr, hi_out_ptr, WORDS_STRIDE: tl.constexpr):
     tl.store(hi_out_ptr + pid_batch, hi)
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 64}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 128}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=16),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=16),
+    ],
+    key=[],
+)
 @triton.jit
 def k_find_first_nonzero_word_batched(words_ptr, n_words_ptr, result_idx_ptr,
                                       WORDS_STRIDE: tl.constexpr,
@@ -213,6 +285,16 @@ def k_find_first_nonzero_word_batched(words_ptr, n_words_ptr, result_idx_ptr,
             tl.atomic_min(result_idx_ptr + pid_batch, idx)
         idx += BLOCK_SIZE
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=1),
+        triton.Config({}, num_warps=2),
+        triton.Config({}, num_warps=4),
+        triton.Config({}, num_warps=8),
+    ],
+    key=[],
+    reset_to_zero=['result_k_ptr'],
+)
 @triton.jit
 def k_word_ctz_batched(words_ptr, word_idx_ptr, result_k_ptr, WORDS_STRIDE: tl.constexpr):
     pid_batch = tl.program_id(0)
@@ -322,10 +404,9 @@ def ctz_batched(x_words, x_hi, scratch):
     result_idx, result_k = scratch['ctz_result_idx'], scratch['ctz_result_k']
     result_idx.fill_(WORDS_CAP)
 
-    block_size = 256
-    grid1 = (x_words.shape[0], block_size)
+    grid1 = lambda META: (x_words.shape[0], META['BLOCK_SIZE'])
     k_find_first_nonzero_word_batched[grid1](
-        x_words, n_words, result_idx, WORDS_STRIDE=WORDS_CAP, BLOCK_SIZE=block_size)
+        x_words, n_words, result_idx, WORDS_STRIDE=WORDS_CAP)
 
     word_idx = torch.where(result_idx >= n_words, -1, result_idx)
     grid2 = (x_words.shape[0],)
@@ -402,7 +483,7 @@ def tournament_selection(population_words, fitness, num_selections, tournament_s
     return population_words.view(torch.int64)[final_indices].view(DTYPE)
 
 @torch.no_grad()
-def breed(p1_words, p2_words, bits_to_flip=2):
+def breed(p1_words, p2_words, bits_to_flip: int):
     num_children = p1_words.shape[0]
     device = p1_words.device
     if num_children == 0:
@@ -718,8 +799,6 @@ def main():
     torch.set_float32_matmul_precision("high")
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
 
-    run_tests()
-    run_extra_tests()
 
     scratch_pad = make_scratch_pad(BATCH_SIZE)
     logging.info(f"Starting main loop: BATCH_SIZE={BATCH_SIZE}, BITS={BITS}")
@@ -736,6 +815,7 @@ def main():
     if not os.path.exists("batches"): os.makedirs("batches")
     if not os.path.exists("records"): os.makedirs("records")
 
+    ran_tests = False
     while True:
         generation_num += 1
         logging.info(f"Starting generation {generation_num}...")
@@ -849,7 +929,12 @@ def main():
         if num_children > 0:
             p1 = tournament_selection(initial_x_words_this_gen, fitness, num_children, tournament_size=3)
             p2 = tournament_selection(initial_x_words_this_gen, fitness, num_children, tournament_size=3)
-            children_words = breed(p1, p2, bits_to_flip=2)
+            # For mutation-only half, make parents identical to skip crossover.
+            num_crossover = num_children // 2
+            p2[num_crossover:] = p1[num_crossover:]
+            import random
+            bits_to_flip = random.choice([2,4,8,16])
+            children_words = breed(p1, p2, bits_to_flip=bits_to_flip)
             next_gen_words[num_elite + num_random:] = children_words
             next_is_original_mask[num_elite + num_random:] = False
 
@@ -857,6 +942,12 @@ def main():
         x_words = next_gen_words.view(torch.int64)[perm].view(DTYPE)
         is_original_mask = next_is_original_mask[perm]
         find_hi_batched(x_words, x_hi)
+
+        if not ran_tests:
+            run_tests()
+            run_extra_tests()
+            ran_tests = True
+
 
 
 if __name__ == "__main__":
