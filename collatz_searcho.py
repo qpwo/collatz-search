@@ -22,11 +22,16 @@ import triton.language as tl
 # ----------------------------
 # Config
 # ----------------------------
-BATCH_SIZE      = 1024 * 32
-BITS            = 1024 * 4
+BATCH_SIZE      = 1024 * 16
+BEST_ORIGINALS_POOL_SIZE = 1024
+num_elite = BATCH_SIZE // 4
+num_random = BATCH_SIZE // 4
+
+BITS            = 1024 # * 2
 WORD_BITS       = 64
 WORDS_TARGET    = (BITS + WORD_BITS - 1) // WORD_BITS # 157
-EXTRA_HEADROOM  = 3
+# EXTRA_HEADROOM  = 3
+EXTRA_HEADROOM  = WORDS_TARGET * 3
 _words_needed   = WORDS_TARGET + EXTRA_HEADROOM       # 160
 # Pad to next power of 2 for tl.arange in k_find_hi_batched
 WORDS_CAP       = 1 << (_words_needed - 1).bit_length() if _words_needed > 0 else 1 # e.g. 160 -> 256
@@ -241,7 +246,7 @@ def shl1_batched(x_words, x_hi, out_words, out_hi, scratch):
     n_words_op = min(max_hi + 2, WORDS_CAP)
     if n_words_op <= 0:
         out_hi.fill_(-1)
-        return
+        return torch.zeros(x_words.shape[0], dtype=torch.bool, device=DEVICE)
 
     n_words_in = x_hi + 1
     grid = (x_words.shape[0], n_words_op)
@@ -258,6 +263,9 @@ def shl1_batched(x_words, x_hi, out_words, out_hi, scratch):
         out_words.view(torch.int64)[mask, new_hi_indices] = 1
 
     find_hi_batched(out_words, out_hi)
+
+    overflow_mask = (top_carry == 1) & ~has_space & (x_hi >= 0)
+    return overflow_mask
 
 @torch.no_grad()
 def shr_k_inplace_batched(x_words, x_hi, k_bits, tmp_buf):
@@ -280,6 +288,7 @@ def add_batched(a_words, a_hi, b_words, b_hi, out_words, out_hi, scratch, plus_o
     n_blocks_per_num = torch.clamp(((max_hi_ab + 2 + BLOCK_WORDS - 1) // BLOCK_WORDS), min=1, max=MAX_BLOCKS).to(torch.int32)
 
     carry0, allones, c_in = scratch['carry0'], scratch['allones'], scratch['c_in']
+    c_in.zero_() # FIX: prevent reading stale carry data for smaller numbers in batch
 
     grid1 = (a_words.shape[0], n_blocks)
     k_add_block_pass1_batched[grid1](a_words, b_words, out_words, carry0, allones,
@@ -303,6 +312,9 @@ def add_batched(a_words, a_hi, b_words, b_hi, out_words, out_hi, scratch, plus_o
         out_words.view(torch.int64)[mask, indices] = 1
 
     find_hi_batched(out_words, out_hi)
+
+    overflow_mask = (final_carry == 1) & (final_carry_word_idx >= WORDS_CAP)
+    return overflow_mask
 
 @torch.no_grad()
 def ctz_batched(x_words, x_hi, scratch):
@@ -347,8 +359,19 @@ def do_steps_fused_batched(x_words, x_hi, scratch, num_steps, active_mask):
         is_even = is_even_batched(x_words)
         odd_mask = current_active & ~is_even
 
-        shl1_batched(x_words, x_hi, tmp_words, tmp_hi, scratch)
-        add_batched(x_words, x_hi, tmp_words, tmp_hi, out_words, out_hi, scratch, plus_one=True)
+        shl_overflow_mask = shl1_batched(x_words, x_hi, tmp_words, tmp_hi, scratch)
+        add_overflow_mask = add_batched(x_words, x_hi, tmp_words, tmp_hi, out_words, out_hi, scratch, plus_one=True)
+        step_overflow_mask = (shl_overflow_mask | add_overflow_mask) & odd_mask
+        if step_overflow_mask.any():
+            idx = torch.where(step_overflow_mask)[0][0].item()
+            # Use a local function to avoid circular dependency with test utils
+            def _num_to_hex(w, h):
+                val = 0
+                for i in range(h, -1, -1): val = (val << 64) | int(w[i])
+                return hex(val)
+            num_str = _num_to_hex(x_words[idx].cpu().numpy(), int(x_hi[idx].item()))
+            raise RuntimeError(f"FATAL: number overflowed at index {idx}. Number: {num_str[:40]}...")
+
         k_odd = ctz_batched(out_words, out_hi, scratch).clone() # clone is crucial
         shr_k_inplace_batched(out_words, out_hi, k_odd, scratch['shr_tmp'])
 
@@ -486,7 +509,7 @@ def run_tests():
     aw, ah = _ints_to_batch(a_ints)
     bw, bh = _ints_to_batch(b_ints)
     ow, oh = scratch['out_words'], scratch['out_hi']
-    add_batched(aw, ah, bw, bh, ow, oh, scratch, plus_one=True)
+    _ = add_batched(aw, ah, bw, bh, ow, oh, scratch, plus_one=True)
     _assert_normalized_b(ow, oh, "add")
     for i in range(BATCH_SIZE):
         expect = (a_ints[i] + b_ints[i] + 1) & BIT_MASK
@@ -506,7 +529,7 @@ def run_tests():
     s_ints = [int.from_bytes(os.urandom(WORDS_CAP * 4), 'little') for _ in range(BATCH_SIZE)]
     sw, sh = _ints_to_batch(s_ints)
     shl_ow, shl_oh = scratch['out_words'], scratch['out_hi']
-    shl1_batched(sw, sh, shl_ow, shl_oh, scratch)
+    _ = shl1_batched(sw, sh, shl_ow, shl_oh, scratch)
     _assert_normalized_b(shl_ow, shl_oh, "shl1")
     for i in range(BATCH_SIZE):
         expect = (s_ints[i] << 1) & BIT_MASK
@@ -575,7 +598,7 @@ def run_extra_tests():
     aw, ah = _ints_to_batch([a1] * BATCH_SIZE)
     bw, bh = _ints_to_batch([b1] * BATCH_SIZE)
     ow, oh = scratch['out_words'], scratch['out_hi']
-    add_batched(aw, ah, bw, bh, ow, oh, scratch, plus_one=False)
+    _ = add_batched(aw, ah, bw, bh, ow, oh, scratch, plus_one=False)
     _assert_normalized(ow, oh, "add-carry-block")
     for i in range(BATCH_SIZE):
         got = _big_to_int_row(ow[i], oh[i])
@@ -586,31 +609,27 @@ def run_extra_tests():
     # sum = (2^(64*BLOCK_WORDS)) - 1; then +1 should produce 2^(64*BLOCK_WORDS)
     aw, ah = _ints_to_batch([ (1 << (64 * BLOCK_WORDS)) - 1 ] * BATCH_SIZE)
     bw, bh = _ints_to_batch([0] * BATCH_SIZE)
-    add_batched(aw, ah, bw, bh, ow, oh, scratch, plus_one=True)
+    _ = add_batched(aw, ah, bw, bh, ow, oh, scratch, plus_one=True)
     _assert_normalized(ow, oh, "add-plusone-propagate")
     for i in range(BATCH_SIZE):
         got = _big_to_int_row(ow[i], oh[i])
         expect = (1 << (64 * BLOCK_WORDS)) & BIT_MASK
         assert got == expect, "[add-plusone-propagate] mismatch"
 
-    # 3) ADD: wraparound near mask limit
+    # 3) ADD: overflow detection near mask limit
     a2 = BIT_MASK - 5
     b2 = 10
     aw, ah = _ints_to_batch([a2] * BATCH_SIZE)
     bw, bh = _ints_to_batch([b2] * BATCH_SIZE)
-    add_batched(aw, ah, bw, bh, ow, oh, scratch, plus_one=False)
-    _assert_normalized(ow, oh, "add-mask-wrap")
-    for i in range(BATCH_SIZE):
-        got = _big_to_int_row(ow[i], oh[i])
-        expect = (a2 + b2) & BIT_MASK  # == 4
-        assert got == expect, "[add-mask-wrap] mismatch"
+    overflow_mask = add_batched(aw, ah, bw, bh, ow, oh, scratch, plus_one=False)
+    assert overflow_mask.all(), "[add-overflow] failed to detect overflow"
 
     # 4) SHL1: top-carry should bump hi by 1 and set new bit0
     k = 10  # any safe index (< WORDS_CAP-2)
     val = 1 << (64 * k + 63)  # MSB of word k
     sw, sh = _ints_to_batch([val] * BATCH_SIZE)
     shl_ow, shl_oh = scratch['out_words'], scratch['out_hi']
-    shl1_batched(sw, sh, shl_ow, shl_oh, scratch)
+    _ = shl1_batched(sw, sh, shl_ow, shl_oh, scratch)
     _assert_normalized(shl_ow, shl_oh, "shl1-top-carry")
     for i in range(BATCH_SIZE):
         got = _big_to_int_row(shl_ow[i], shl_oh[i])
@@ -657,6 +676,23 @@ def run_extra_tests():
     assert next_vals == py_next, f"[odd-path] next mismatch: {next_vals} vs {py_next}"
     assert steps.cpu().tolist() == py_steps, f"[odd-path] step mismatch: {steps} vs {py_steps}"
 
+    # 8) Overflow detection
+    # Craft a number that is guaranteed to overflow on 3n+1
+    overflow_n = (1 << (64 * WORDS_CAP)) - 1
+    # Use a BATCH_SIZE of 1 for this test
+    xw_ovf, xh_ovf = _ints_to_batch([overflow_n] * 1)
+    active_ovf = torch.ones(1, dtype=torch.bool, device=DEVICE)
+    try:
+        do_steps_fused_batched(xw_ovf, xh_ovf, scratch, 1, active_ovf)
+        assert False, "[overflow-test] did not raise RuntimeError on overflow"
+    except RuntimeError as e:
+        if "overflowed" in str(e):
+            print("[tests-extra] Overflow check OK")
+        else:
+            assert False, f"[overflow-test] raised unexpected RuntimeError: {e}"
+    except Exception as e:
+        assert False, f"[overflow-test] raised unexpected exception type: {type(e).__name__}: {e}"
+
     print("[tests-extra] All OK")
     BATCH_SIZE = orig_batch_size
 
@@ -690,7 +726,6 @@ def main():
     total_steps_all_time, start_time_all_time = 0, time.time()
     record_steps, record_idx, record_gen = 0, 0, 0
 
-    BEST_ORIGINALS_POOL_SIZE = 2048
     best_originals_words = torch.empty((0, WORDS_CAP), dtype=DTYPE, device=DEVICE)
     best_originals_fitness = torch.empty(0, dtype=torch.int64, device=DEVICE)
 
@@ -777,8 +812,6 @@ def main():
 
         # --- Evolutionary Step ---
         fitness = total_steps_this_batch
-        num_elite = BATCH_SIZE // 4
-        num_random = BATCH_SIZE // 4
         num_children = BATCH_SIZE - num_elite - num_random
 
         next_gen_words = torch.empty_like(x_words)
